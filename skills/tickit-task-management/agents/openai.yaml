@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tickit Task Management"
+  short_description: "Use Tickit for project task workflows"
+  default_prompt: "Use Tickit to manage the project queue safely."
