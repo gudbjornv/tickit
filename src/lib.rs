@@ -21,7 +21,10 @@ pub mod theme;
 
 pub use config::{Config, SyncConfig};
 pub use db::Database;
-pub use models::{ExportFormat, List, Priority, Tag, Task};
+pub use models::{
+    AgentJob, AgentRun, AgentRunUpdate, ExportFormat, List, Priority, Tag, Task, TaskDependency,
+    TaskEvent, TaskStatus, TaskWorkflow,
+};
 pub use sync::{SyncClient, SyncRecord, SyncRequest, SyncResponse, SyncStatus};
 pub use theme::Theme;
 

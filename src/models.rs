@@ -224,6 +224,159 @@ impl Task {
     }
 }
 
+/// Workflow state used by project-aware and agent-managed tasks.
+///
+/// The legacy `Task.completed` flag remains the source of truth for the
+/// existing UI and sync protocol; workflow records provide richer state for
+/// automation without breaking older databases or servers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    #[default]
+    Backlog,
+    Ready,
+    Claimed,
+    InProgress,
+    Blocked,
+    InReview,
+    Verified,
+    Done,
+    Cancelled,
+}
+
+impl TaskStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Backlog => "backlog",
+            Self::Ready => "ready",
+            Self::Claimed => "claimed",
+            Self::InProgress => "in_progress",
+            Self::Blocked => "blocked",
+            Self::InReview => "in_review",
+            Self::Verified => "verified",
+            Self::Done => "done",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "backlog" => Some(Self::Backlog),
+            "ready" => Some(Self::Ready),
+            "claimed" => Some(Self::Claimed),
+            "in_progress" | "in-progress" | "inprogress" => Some(Self::InProgress),
+            "blocked" => Some(Self::Blocked),
+            "in_review" | "in-review" | "inreview" => Some(Self::InReview),
+            "verified" => Some(Self::Verified),
+            "done" | "complete" | "completed" => Some(Self::Done),
+            "cancelled" | "canceled" => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Rich workflow metadata stored separately from the legacy task record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskWorkflow {
+    pub task_id: Uuid,
+    pub status: TaskStatus,
+    pub created_by: Option<String>,
+    pub owner: Option<String>,
+    pub review_required: bool,
+    pub blocked_reason: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskDependency {
+    pub task_id: Uuid,
+    pub depends_on: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskEvent {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub actor: String,
+    pub event_type: String,
+    pub message: Option<String>,
+    pub metadata: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRun {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub agent: String,
+    pub conversation_id: Option<String>,
+    pub status: String,
+    pub workspace: Option<String>,
+    pub branch: Option<String>,
+    pub commit_sha: Option<String>,
+    pub pull_request_url: Option<String>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRunUpdate {
+    pub status: String,
+    pub workspace: Option<String>,
+    pub branch: Option<String>,
+    pub commit_sha: Option<String>,
+    pub pull_request_url: Option<String>,
+    pub error: Option<String>,
+    pub actor: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentJob {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub agent: String,
+    pub status: String,
+    pub instructions: Option<String>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A local, non-synced notification scheduled for a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reminder {
+    pub id: Uuid,
+    pub task_id: Uuid,
+    pub scheduled_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub claimed_at: Option<DateTime<Utc>>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+impl Reminder {
+    pub fn new(task_id: Uuid, scheduled_at: DateTime<Utc>) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            task_id,
+            scheduled_at,
+            created_at: now,
+            updated_at: now,
+            claimed_at: None,
+            delivered_at: None,
+        }
+    }
+}
+
 /// A list/project that contains tasks
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct List {

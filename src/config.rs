@@ -32,6 +32,14 @@ pub struct Config {
     #[serde(default = "default_notifications")]
     pub notifications: bool,
 
+    /// How long overdue explicit reminders remain eligible for delivery.
+    #[serde(default = "default_reminder_grace_minutes")]
+    pub reminder_grace_minutes: u64,
+
+    /// How long a reminder claim may remain unfinalized before retry.
+    #[serde(default = "default_reminder_claim_lease_minutes")]
+    pub reminder_claim_lease_minutes: u64,
+
     /// Sync configuration (optional)
     #[serde(default)]
     pub sync: SyncConfig,
@@ -71,6 +79,14 @@ fn default_notifications() -> bool {
     true
 }
 
+fn default_reminder_grace_minutes() -> u64 {
+    1440
+}
+
+fn default_reminder_claim_lease_minutes() -> u64 {
+    5
+}
+
 fn default_sync_interval() -> u64 {
     300 // 5 minutes
 }
@@ -84,6 +100,8 @@ impl Default for Config {
             date_format: default_date_format(),
             vim_mode: default_vim_mode(),
             notifications: default_notifications(),
+            reminder_grace_minutes: default_reminder_grace_minutes(),
+            reminder_claim_lease_minutes: default_reminder_claim_lease_minutes(),
             sync: SyncConfig::default(),
         }
     }
@@ -137,5 +155,17 @@ impl Config {
         std::fs::write(path, content).context("Failed to write config file")?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_config_without_reminder_settings_uses_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.reminder_grace_minutes, 1440);
+        assert_eq!(config.reminder_claim_lease_minutes, 5);
     }
 }
