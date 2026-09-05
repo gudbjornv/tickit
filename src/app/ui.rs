@@ -270,6 +270,24 @@ fn render_tasks_view(frame: &mut Frame, state: &AppState, area: Rect) {
                 Span::styled(&task.title, title_style),
             ];
 
+            if let Some(workflow) = state.workflows.get(&task.id)
+                && (!matches!(workflow.status, crate::models::TaskStatus::Ready)
+                    || workflow.owner.is_some())
+            {
+                spans.push(Span::styled(
+                    format!(
+                        " [{}{}]",
+                        workflow.status,
+                        workflow
+                            .owner
+                            .as_deref()
+                            .map(|owner| format!(" {owner}"))
+                            .unwrap_or_default()
+                    ),
+                    colors.text_secondary(),
+                ));
+            }
+
             // Add due date indicator
             if let Some(due_date) = task.due_date {
                 let now = chrono::Utc::now();
@@ -284,7 +302,16 @@ fn render_tasks_view(frame: &mut Frame, state: &AppState, area: Rect) {
                     colors.text_muted()
                 };
 
-                let due_str = due_date.format("%m/%d").to_string();
+                let due_str = if due_date.time()
+                    == chrono::NaiveTime::from_hms_opt(23, 59, 59).expect("valid time")
+                {
+                    due_date.format("%m/%d").to_string()
+                } else {
+                    due_date
+                        .with_timezone(&chrono::Local)
+                        .format("%m/%d %H:%M")
+                        .to_string()
+                };
                 spans.push(Span::styled(format!(" 📅{}", due_str), due_style));
             }
 
@@ -564,6 +591,10 @@ fn render_help_popup(frame: &mut Frame, state: &AppState) {
         Line::from(vec![
             Span::styled("  o                  ", colors.key_hint()),
             Span::styled("Open task URL", colors.text()),
+        ]),
+        Line::from(vec![
+            Span::styled("  a                  ", colors.key_hint()),
+            Span::styled("Queue selected task for an agent", colors.text()),
         ]),
         Line::from(vec![
             Span::styled("  c                  ", colors.key_hint()),
@@ -856,7 +887,7 @@ fn render_confirm_dialog(frame: &mut Frame, state: &AppState) {
 /// Render task editor
 fn render_task_editor(frame: &mut Frame, state: &AppState) {
     let colors = state.theme.colors();
-    let area = centered_rect(60, 70, frame.area());
+    let area = centered_rect(65, 78, frame.area());
 
     frame.render_widget(Clear, area);
 
@@ -873,6 +904,7 @@ fn render_task_editor(frame: &mut Frame, state: &AppState) {
             Constraint::Length(3), // Title input
             Constraint::Length(3), // Description input
             Constraint::Length(3), // Due Date input
+            Constraint::Length(3), // Reminders input
             Constraint::Length(3), // Priority
             Constraint::Length(3), // List
             Constraint::Min(5),    // Tags (expanded)
@@ -944,7 +976,7 @@ fn render_task_editor(frame: &mut Frame, state: &AppState) {
         state.editor_due_date_buffer.as_str()
     };
     let due_placeholder = if due_display.is_empty() {
-        "YYYY-MM-DD"
+        "YYYY-MM-DD or YYYY-MM-DD HH:MM"
     } else {
         due_display
     };
@@ -956,7 +988,7 @@ fn render_task_editor(frame: &mut Frame, state: &AppState) {
         })
         .block(
             Block::default()
-                .title(" Due Date (optional) ")
+                .title(" Due (optional; local time unless RFC3339) ")
                 .borders(Borders::ALL)
                 .border_style(due_style),
         );
@@ -964,6 +996,38 @@ fn render_task_editor(frame: &mut Frame, state: &AppState) {
 
     if due_focused && !state.editor_adding_tag {
         frame.set_cursor_position((chunks[2].x + state.cursor_pos as u16 + 1, chunks[2].y + 1));
+    }
+
+    let reminders_focused = state.editor_field == EditorField::Reminders;
+    let reminders_display = if reminders_focused {
+        state.input_buffer.as_str()
+    } else {
+        state.editor_reminders_buffer.as_str()
+    };
+    let reminders_text = if reminders_display.is_empty() {
+        "2026-07-20 09:00, 2h-before"
+    } else {
+        reminders_display
+    };
+    let reminders_input = Paragraph::new(reminders_text)
+        .style(if reminders_display.is_empty() && !reminders_focused {
+            colors.text_muted()
+        } else {
+            colors.text()
+        })
+        .block(
+            Block::default()
+                .title(" Reminders (optional, comma-separated) ")
+                .borders(Borders::ALL)
+                .border_style(if reminders_focused {
+                    colors.block_focus()
+                } else {
+                    colors.block()
+                }),
+        );
+    frame.render_widget(reminders_input, chunks[3]);
+    if reminders_focused && !state.editor_adding_tag {
+        frame.set_cursor_position((chunks[3].x + state.cursor_pos as u16 + 1, chunks[3].y + 1));
     }
 
     // Priority field
@@ -984,7 +1048,7 @@ fn render_task_editor(frame: &mut Frame, state: &AppState) {
             .borders(Borders::ALL)
             .border_style(priority_style),
     );
-    frame.render_widget(priority_input, chunks[3]);
+    frame.render_widget(priority_input, chunks[4]);
 
     // List field
     let list_focused = state.editor_field == EditorField::List;
@@ -1004,7 +1068,7 @@ fn render_task_editor(frame: &mut Frame, state: &AppState) {
             .borders(Borders::ALL)
             .border_style(list_style),
     );
-    frame.render_widget(list_input, chunks[4]);
+    frame.render_widget(list_input, chunks[5]);
 
     // Tags field - show as selectable list
     let tags_focused = state.editor_field == EditorField::Tags;
@@ -1079,7 +1143,7 @@ fn render_task_editor(frame: &mut Frame, state: &AppState) {
             .borders(Borders::ALL)
             .border_style(tags_style),
     );
-    frame.render_widget(tags_list, chunks[5]);
+    frame.render_widget(tags_list, chunks[6]);
 
     // Help text
     let help_text = if state.editor_adding_tag {
@@ -1090,7 +1154,7 @@ fn render_task_editor(frame: &mut Frame, state: &AppState) {
     let help = Paragraph::new(help_text)
         .style(colors.text_muted())
         .alignment(Alignment::Center);
-    frame.render_widget(help, chunks[6]);
+    frame.render_widget(help, chunks[7]);
 
     // Outer block
     let outer = Block::default()

@@ -233,13 +233,17 @@ fn handle_tasks_view(state: &mut AppState, key: KeyEvent) {
                 state.focus = Focus::Main;
             }
             Focus::Main => {
-                let _ = state.toggle_task();
+                if let Err(error) = state.toggle_task() {
+                    state.set_status(format!("Unable to toggle task: {error}"));
+                }
             }
         },
 
         // Space or x - toggle task completion
         KeyCode::Char(' ') | KeyCode::Char('x') if state.focus == Focus::Main => {
-            let _ = state.toggle_task();
+            if let Err(error) = state.toggle_task() {
+                state.set_status(format!("Unable to toggle task: {error}"));
+            }
         }
 
         // Add new task (n like Hazelnut)
@@ -270,6 +274,13 @@ fn handle_tasks_view(state: &mut AppState, key: KeyEvent) {
         // Open URL (o)
         KeyCode::Char('o') if state.focus == Focus::Main => {
             state.open_task_url();
+        }
+
+        // Queue selected task for an agent (a)
+        KeyCode::Char('a') if state.focus == Focus::Main => {
+            if let Err(error) = state.dispatch_selected_task() {
+                state.set_status(format!("Agent queue error: {error}"));
+            }
         }
 
         // Refresh (r)
@@ -675,7 +686,10 @@ fn handle_task_editor(state: &mut AppState, key: KeyEvent) {
     // Check if we're in a text input field
     let is_text_field = matches!(
         state.editor_field,
-        EditorField::Title | EditorField::Description | EditorField::DueDate
+        EditorField::Title
+            | EditorField::Description
+            | EditorField::DueDate
+            | EditorField::Reminders
     );
 
     match key.code {
@@ -799,10 +813,8 @@ fn handle_list_editor(state: &mut AppState, key: KeyEvent) {
                 state.cursor_pos -= 1;
             }
         }
-        KeyCode::Right => {
-            if state.cursor_pos < state.input_buffer.len() {
-                state.cursor_pos += 1;
-            }
+        KeyCode::Right if state.cursor_pos < state.input_buffer.len() => {
+            state.cursor_pos += 1;
         }
         _ => {}
     }
@@ -838,10 +850,8 @@ fn handle_tag_editor(state: &mut AppState, key: KeyEvent) {
                 state.cursor_pos -= 1;
             }
         }
-        KeyCode::Right => {
-            if state.cursor_pos < state.input_buffer.len() {
-                state.cursor_pos += 1;
-            }
+        KeyCode::Right if state.cursor_pos < state.input_buffer.len() => {
+            state.cursor_pos += 1;
         }
         _ => {}
     }
@@ -878,10 +888,8 @@ fn handle_about(state: &mut AppState, key: KeyEvent) {
             let _ = open::that("https://github.com/ricardodantas/tickit");
         }
         // Handle update from about dialog
-        KeyCode::Char('u') | KeyCode::Char('U') => {
-            if state.update_available.is_some() {
-                state.mode = Mode::UpdateConfirm;
-            }
+        KeyCode::Char('u') | KeyCode::Char('U') if state.update_available.is_some() => {
+            state.mode = Mode::UpdateConfirm;
         }
         _ => {}
     }

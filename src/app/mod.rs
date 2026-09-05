@@ -61,7 +61,7 @@ pub fn run() -> Result<()> {
         let db_for_notifications = Database::open().ok();
         std::thread::spawn(move || {
             if let Some(db) = db_for_notifications {
-                let _ = check_and_notify_due_tasks(&db);
+                let _ = notifications::check_due_tasks(&db);
             }
         });
     }
@@ -111,17 +111,51 @@ fn run_app(
             sync_in_progress = false;
             match result {
                 Ok(response) => {
-                    // Apply incoming changes from server
-                    let _applied = apply_incoming_changes(&state.db, &response);
-
-                    // Update last sync time in DB
-                    let _ = state.db.set_last_sync(response.server_time);
-                    state.set_last_sync(response.server_time);
-
-                    // Sync indicator on the right shows "Synced" status
-
-                    // Refresh data after sync
-                    let _ = state.refresh_data();
+                    match state.db.apply_sync_records(&response.changes) {
+                        Ok(report) if report.rejected.is_empty() => {
+                            // Advance the cursor only after every incoming
+                            // record was applied successfully.
+                            if let Err(error) = state.db.set_last_sync(response.server_time) {
+                                state.set_sync_error(Some(format!(
+                                    "Sync applied but last_sync was not saved: {error}"
+                                )));
+                                state.sync_pending = true;
+                            } else {
+                                state.set_last_sync(response.server_time);
+                                if let Err(error) = state.refresh_data() {
+                                    state.set_sync_error(Some(format!(
+                                        "Sync applied but refresh failed: {error}"
+                                    )));
+                                }
+                            }
+                        }
+                        Ok(report) => {
+                            let rejected = report
+                                .rejected
+                                .iter()
+                                .map(|failure| {
+                                    format!(
+                                        "{}: {}",
+                                        sync_record_label(&failure.record),
+                                        failure.error
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            state.sync_pending = true;
+                            state.set_sync_error(Some(format!(
+                                "Sync incomplete: applied {}, rejected {} ({rejected})",
+                                report.applied,
+                                report.rejected.len()
+                            )));
+                        }
+                        Err(error) => {
+                            state.sync_pending = true;
+                            state.set_sync_error(Some(format!(
+                                "Sync apply failed; retryable: {error}"
+                            )));
+                        }
+                    }
                 }
                 Err(e) => {
                     state.set_sync_error(Some(e.clone()));
@@ -272,109 +306,12 @@ fn gather_local_changes(
     changes
 }
 
-/// Apply incoming changes from the server to the local database
-fn apply_incoming_changes(db: &Database, response: &SyncResponse) -> usize {
-    let mut applied = 0;
-
-    // Sort changes: lists first, then tags, then tasks (to satisfy FK constraints)
-    let mut lists = Vec::new();
-    let mut tags = Vec::new();
-    let mut tasks = Vec::new();
-    let mut task_tags = Vec::new();
-    let mut deletes = Vec::new();
-
-    for record in &response.changes {
-        match record {
-            SyncRecord::List(_) => lists.push(record),
-            SyncRecord::Tag(_) => tags.push(record),
-            SyncRecord::Task(_) => tasks.push(record),
-            SyncRecord::TaskTag(_) => task_tags.push(record),
-            SyncRecord::Deleted { .. } => deletes.push(record),
-        }
+fn sync_record_label(record: &SyncRecord) -> &'static str {
+    match record {
+        SyncRecord::Task(_) => "task",
+        SyncRecord::List(_) => "list",
+        SyncRecord::Tag(_) => "tag",
+        SyncRecord::TaskTag(_) => "task_tag",
+        SyncRecord::Deleted { .. } => "deletion",
     }
-
-    // Disable FK constraints during sync
-    let _ = db.execute_raw("PRAGMA foreign_keys = OFF");
-
-    // Apply in order: lists, tags, tasks, task_tags, deletes
-    for record in lists
-        .iter()
-        .chain(tags.iter())
-        .chain(tasks.iter())
-        .chain(task_tags.iter())
-        .chain(deletes.iter())
-    {
-        let result = match record {
-            SyncRecord::Task(task) => db.upsert_task(task),
-            SyncRecord::List(list) => db.upsert_list(list),
-            SyncRecord::Tag(tag) => db.upsert_tag(tag),
-            SyncRecord::TaskTag(link) => db.upsert_task_tag(link),
-            SyncRecord::Deleted {
-                id, record_type, ..
-            } => {
-                match record_type {
-                    RecordType::Task => db.delete_task_by_id(*id),
-                    RecordType::List => db.delete_list_by_id(*id),
-                    RecordType::Tag => db.delete_tag_by_id(*id),
-                    RecordType::TaskTag => Ok(()), // Handled by task update
-                }
-            }
-        };
-
-        if result.is_ok() {
-            applied += 1;
-        }
-    }
-
-    // Re-enable FK constraints
-    let _ = db.execute_raw("PRAGMA foreign_keys = ON");
-
-    applied
-}
-
-/// Check for tasks due today/tomorrow and send notifications
-fn check_and_notify_due_tasks(db: &Database) -> usize {
-    use crate::models::Priority;
-    use chrono::Local;
-
-    let today = Local::now().date_naive();
-    let tomorrow = today.succ_opt().unwrap_or(today);
-
-    let mut notified = 0;
-
-    // Get all incomplete tasks with due dates
-    if let Ok(tasks) = db.get_all_tasks() {
-        for task in tasks {
-            // Skip completed tasks
-            if task.completed {
-                continue;
-            }
-
-            // Check if task has a due date
-            if let Some(due_datetime) = &task.due_date {
-                let due_date = due_datetime.date_naive();
-
-                if due_date == today {
-                    // Task is due today
-                    if notifications::notify_task_due_today(&task).is_ok() {
-                        notified += 1;
-                    }
-                } else if due_date == tomorrow
-                    && (task.priority == Priority::High || task.priority == Priority::Urgent)
-                {
-                    // High/urgent task due tomorrow - advance warning
-                    if notifications::notify_task_due_tomorrow(&task).is_ok() {
-                        notified += 1;
-                    }
-                } else if due_date < today {
-                    // Task is overdue
-                    if notifications::notify_task_overdue(&task).is_ok() {
-                        notified += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    notified
 }

@@ -1,11 +1,12 @@
 //! Application state management
 
 use anyhow::Result;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::config::Config;
 use crate::db::Database;
-use crate::models::{List, Priority, Tag, Task};
+use crate::models::{List, Priority, Reminder, Tag, Task, TaskStatus, TaskWorkflow};
 use crate::sync::SyncStatus;
 use crate::theme::Theme;
 
@@ -152,6 +153,7 @@ pub enum EditorField {
     List,
     Tags,
     DueDate,
+    Reminders,
     Name,
     Icon,
     Color,
@@ -181,6 +183,8 @@ pub struct AppState {
     pub tags: Vec<Tag>,
     /// Current tasks (filtered by selected list)
     pub tasks: Vec<Task>,
+    /// Workflow records loaded during the last refresh (used by rendering)
+    pub workflows: HashMap<Uuid, TaskWorkflow>,
     /// Currently selected list ID (None = all tasks)
     pub selected_list_id: Option<Uuid>,
 
@@ -229,6 +233,8 @@ pub struct AppState {
     pub editor_description_buffer: String,
     /// Due date buffer for tasks (YYYY-MM-DD format)
     pub editor_due_date_buffer: String,
+    /// Comma-separated absolute reminder times or offsets such as `2h-before`.
+    pub editor_reminders_buffer: String,
 
     // UI state
     /// Show completed tasks
@@ -286,6 +292,7 @@ impl AppState {
             lists: Vec::new(),
             tags: Vec::new(),
             tasks: Vec::new(),
+            workflows: HashMap::new(),
             selected_list_id: None,
             list_index: 0,
             task_index: 0,
@@ -308,6 +315,7 @@ impl AppState {
             editor_title_buffer: String::new(),
             editor_description_buffer: String::new(),
             editor_due_date_buffer: String::new(),
+            editor_reminders_buffer: String::new(),
             show_completed,
             confirm_message: String::new(),
             confirm_action: None,
@@ -376,6 +384,10 @@ impl AppState {
                 .get_tasks_with_filter(None, completed_filter, None)?
         };
 
+        // Rendering must use this refresh-time cache rather than issuing one
+        // database query per task on every frame.
+        self.workflows = self.db.get_task_workflows()?;
+
         // Clamp task index
         if !self.tasks.is_empty() && self.task_index >= self.tasks.len() {
             self.task_index = self.tasks.len() - 1;
@@ -404,6 +416,17 @@ impl AppState {
         self.show_completed = !self.show_completed;
         self.config.show_completed = self.show_completed;
         let _ = self.refresh_tasks();
+    }
+
+    /// Queue the selected task for the configured local agent bridge.
+    pub fn dispatch_selected_task(&mut self) -> Result<()> {
+        let task = self
+            .selected_task()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no task selected"))?;
+        self.db.enqueue_agent_job(task.id, "codex", None, "tui")?;
+        self.set_status(format!("Queued agent work for {}", task.title));
+        Ok(())
     }
 
     /// Set a status message
@@ -435,6 +458,7 @@ impl AppState {
         self.editor_title_buffer.clear();
         self.editor_description_buffer.clear();
         self.editor_due_date_buffer.clear();
+        self.editor_reminders_buffer.clear();
 
         // Set editor list to current selected list or inbox
         if let Some(list_id) = self.selected_list_id {
@@ -469,8 +493,17 @@ impl AppState {
             self.editor_description_buffer = task.description.clone().unwrap_or_default();
             self.editor_due_date_buffer = task
                 .due_date
-                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .map(format_editor_datetime)
                 .unwrap_or_default();
+            self.editor_reminders_buffer = self
+                .db
+                .list_reminders_for_task(task.id)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|r| r.delivered_at.is_none())
+                .map(|r| format_reminder_datetime(r.scheduled_at))
+                .collect::<Vec<_>>()
+                .join(", ");
             self.editing_task = Some(task);
         }
     }
@@ -513,16 +546,46 @@ impl AppState {
         };
 
         // Parse due date from buffer
-        let due_date = if self.editor_field == EditorField::DueDate {
-            Self::parse_due_date(&self.input_buffer)
+        let due_value = if self.editor_field == EditorField::DueDate {
+            self.input_buffer.clone()
         } else {
-            Self::parse_due_date(&self.editor_due_date_buffer)
+            self.editor_due_date_buffer.clone()
+        };
+        let due_date = if due_value.trim().is_empty() {
+            None
+        } else {
+            match crate::notifications::parse_datetime(&due_value) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    self.set_status(format!("Invalid due time: {error}"));
+                    return Ok(());
+                }
+            }
+        };
+        let reminder_value = if self.editor_field == EditorField::Reminders {
+            self.input_buffer.clone()
+        } else {
+            self.editor_reminders_buffer.clone()
         };
 
         if title.is_empty() {
             self.set_status("Task title cannot be empty");
             return Ok(());
         }
+
+        let reminder_times = match reminder_value
+            .split(',')
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|value| crate::notifications::parse_reminder_spec(value, due_date))
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(values) => values,
+            Err(error) => {
+                self.set_status(format!("Invalid reminder: {error}"));
+                return Ok(());
+            }
+        };
 
         if let Some(mut task) = self.editing_task.take() {
             // Update existing task
@@ -534,6 +597,11 @@ impl AppState {
             task.due_date = due_date;
             task.updated_at = chrono::Utc::now();
             self.db.update_task(&task)?;
+            let reminders: Vec<_> = reminder_times
+                .into_iter()
+                .map(|at| Reminder::new(task.id, at))
+                .collect();
+            self.db.replace_pending_reminders(task.id, &reminders)?;
             self.set_status("Task updated");
         } else {
             // Create new task
@@ -542,7 +610,11 @@ impl AppState {
             task.priority = self.editor_priority;
             task.tag_ids = tag_ids;
             task.due_date = due_date;
-            self.db.insert_task(&task)?;
+            let reminders: Vec<_> = reminder_times
+                .into_iter()
+                .map(|at| Reminder::new(task.id, at))
+                .collect();
+            self.db.insert_task_with_reminders(&task, &reminders)?;
             self.set_status("Task created");
         }
 
@@ -554,18 +626,30 @@ impl AppState {
 
     /// Toggle completion of the selected task
     pub fn toggle_task(&mut self) -> Result<()> {
-        if let Some(task) = self.tasks.get_mut(self.task_index) {
-            task.toggle();
-            self.db.update_task(task)?;
-            let status = if task.completed {
-                "completed"
-            } else {
-                "reopened"
-            };
-            self.set_status(format!("Task {}", status));
-            self.refresh_tasks()?;
-            self.mark_sync_pending();
+        let Some(current) = self.tasks.get(self.task_index).cloned() else {
+            return Ok(());
+        };
+        if self
+            .workflows
+            .get(&current.id)
+            .is_some_and(|workflow| workflow.status == TaskStatus::Cancelled)
+        {
+            anyhow::bail!("cancelled tasks are terminal; change workflow status explicitly");
         }
+
+        let mut updated = current;
+        updated.toggle();
+        // Persist first. If dependency validation rejects the completion, the
+        // in-memory checkbox remains exactly as it was before the keypress.
+        self.db.update_task(&updated)?;
+        let status = if updated.completed {
+            "completed"
+        } else {
+            "reopened"
+        };
+        self.set_status(format!("Task {}", status));
+        self.refresh_tasks()?;
+        self.mark_sync_pending();
         Ok(())
     }
 
@@ -842,7 +926,8 @@ impl AppState {
         self.editor_field = match self.editor_field {
             EditorField::Title => EditorField::Description,
             EditorField::Description => EditorField::DueDate,
-            EditorField::DueDate => EditorField::Priority,
+            EditorField::DueDate => EditorField::Reminders,
+            EditorField::Reminders => EditorField::Priority,
             EditorField::Priority => EditorField::List,
             EditorField::List => EditorField::Tags,
             EditorField::Tags => EditorField::Title,
@@ -859,7 +944,8 @@ impl AppState {
             EditorField::Title => EditorField::Tags,
             EditorField::Description => EditorField::Title,
             EditorField::DueDate => EditorField::Description,
-            EditorField::Priority => EditorField::DueDate,
+            EditorField::Priority => EditorField::Reminders,
+            EditorField::Reminders => EditorField::DueDate,
             EditorField::List => EditorField::Priority,
             EditorField::Tags => EditorField::List,
             _ => EditorField::Title,
@@ -879,6 +965,7 @@ impl AppState {
             EditorField::DueDate => {
                 self.editor_due_date_buffer = self.input_buffer.clone();
             }
+            EditorField::Reminders => self.editor_reminders_buffer = self.input_buffer.clone(),
             _ => {}
         }
     }
@@ -889,20 +976,10 @@ impl AppState {
             EditorField::Title => self.editor_title_buffer.clone(),
             EditorField::Description => self.editor_description_buffer.clone(),
             EditorField::DueDate => self.editor_due_date_buffer.clone(),
+            EditorField::Reminders => self.editor_reminders_buffer.clone(),
             _ => String::new(),
         };
         self.cursor_pos = self.input_buffer.len();
-    }
-
-    /// Parse a due date string (YYYY-MM-DD format) into a DateTime
-    fn parse_due_date(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-        if s.trim().is_empty() {
-            return None;
-        }
-        // Parse YYYY-MM-DD format
-        chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
-            .ok()
-            .map(|date| date.and_hms_opt(23, 59, 59).unwrap().and_utc())
     }
 
     /// Set update available from background check
@@ -958,5 +1035,78 @@ impl AppState {
         if self.is_sync_enabled() {
             self.sync_pending = true;
         }
+    }
+}
+
+fn format_editor_datetime(value: chrono::DateTime<chrono::Utc>) -> String {
+    if value.time() == chrono::NaiveTime::from_hms_opt(23, 59, 59).expect("valid time") {
+        value.format("%Y-%m-%d").to_string()
+    } else {
+        value.with_timezone(&chrono::Local).to_rfc3339()
+    }
+}
+
+fn format_reminder_datetime(value: chrono::DateTime<chrono::Utc>) -> String {
+    value.with_timezone(&chrono::Local).to_rfc3339()
+}
+
+#[cfg(test)]
+mod reminder_editor_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use tempfile::tempdir;
+
+    #[test]
+    fn reminder_editor_format_includes_an_explicit_offset() {
+        let value = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 25, 1, 30, 0)
+            .unwrap();
+        let rendered = format_reminder_datetime(value);
+        assert!(chrono::DateTime::parse_from_rfc3339(&rendered).is_ok());
+        assert!(
+            rendered.ends_with('Z') || rendered[10..].contains('+') || rendered[10..].contains('-')
+        );
+    }
+
+    #[test]
+    fn precise_due_editor_format_includes_an_explicit_offset() {
+        let value = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 25, 1, 30, 0)
+            .unwrap();
+        let rendered = format_editor_datetime(value);
+        assert!(chrono::DateTime::parse_from_rfc3339(&rendered).is_ok());
+    }
+
+    #[test]
+    fn dependency_rejection_does_not_flip_the_in_memory_checkbox() {
+        let dir = tempdir().unwrap();
+        let db = Database::open_path(&dir.path().join("toggle.sqlite")).unwrap();
+        let inbox = db.get_inbox().unwrap();
+        let prerequisite = Task::new("Prerequisite", inbox.id);
+        let dependent = Task::new("Dependent", inbox.id);
+        db.insert_task(&prerequisite).unwrap();
+        db.insert_task(&dependent).unwrap();
+        db.add_dependency(dependent.id, prerequisite.id).unwrap();
+
+        let mut state = AppState::new(Config::default(), db).unwrap();
+        state.task_index = state
+            .tasks
+            .iter()
+            .position(|task| task.id == dependent.id)
+            .unwrap();
+        assert!(!state.tasks[state.task_index].completed);
+
+        assert!(state.toggle_task().is_err());
+        assert!(!state.tasks[state.task_index].completed);
+        assert!(
+            !state
+                .db
+                .get_all_tasks()
+                .unwrap()
+                .into_iter()
+                .find(|task| task.id == dependent.id)
+                .unwrap()
+                .completed
+        );
     }
 }
