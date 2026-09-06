@@ -37,6 +37,10 @@ cargo install tickit
 - **Priority Levels**: None, Low, Medium, High, Urgent
 - **Task URLs**: Attach links and open them with `o`
 - **Due Dates**: Set deadlines with visual indicators
+- **Reminders**: Explicit per-task reminders with offsets, snooze, and desktop notifications
+- **Project Workflow**: Workflow statuses, ownership, and prerequisite dependencies
+- **Agent Queue**: Queue, claim, and record external agent jobs and run evidence
+- **Machine-Readable Query**: `tickit query` emits project state as JSON for LLM tooling
 - **Export**: JSON, todo.txt, Markdown, CSV formats
 - **Auto-Update**: Check for updates from CLI or TUI
 - **SQLite Storage**: Fast, reliable, self-contained
@@ -58,6 +62,20 @@ tickit list --list Work        # Filter by list
 # Complete/uncomplete
 tickit done "Buy groceries"
 tickit undo "Buy groceries"
+
+# Reminders
+tickit add "Ship release" --due 2026-09-10 --remind 2h-before
+tickit reminders list
+tickit reminders check             # deliver anything due
+
+# Project workflow (see the tickit-task-management skill)
+tickit query --project Work --status ready
+tickit workflow set TASK_UUID in_progress --actor agent --owner agent
+tickit workflow depends-on TASK_UUID PREREQUISITE_UUID
+
+# Agent queue
+tickit agent enqueue TASK_UUID --agent codex
+tickit agent next --actor orchestrator
 
 # Export
 tickit export --format markdown --output tasks.md
